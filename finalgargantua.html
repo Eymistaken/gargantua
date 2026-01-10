@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="tr">
+
+<head>
+    <meta charset="UTF-8">
+    <!-- Mobilde sayfa büyütmeyi engelle, uygulama hissi ver -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gargantua Simülasyonu v9 - Dokunmatik</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            width: 100vw;
+            height: 100vh;
+            /* ÖNEMLİ: Dokunmatik ekranda sayfa kaydırmayı engeller */
+            touch-action: none;
+        }
+
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.9);
+            pointer-events: none;
+            z-index: 2;
+            font-family: 'Segoe UI', sans-serif;
+            mix-blend-mode: difference;
+        }
+
+        h1 {
+            margin: 0;
+            font-weight: 300;
+            letter-spacing: 3px;
+            font-size: 1.5rem;
+            text-transform: uppercase;
+        }
+
+        p {
+            font-size: 0.9rem;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 30px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.6);
+            font-family: monospace;
+            z-index: 2;
+            pointer-events: none;
+            font-size: 12px;
+            padding: 0 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="ui">
+        <h1>GARGANTUA</h1>
+        <p>Sinematik / Dokunmatik</p>
+    </div>
+
+    <div class="controls">Tek Parmak: Çevir • Çift Parmak: Yakınlaş</div>
+
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const container = document.getElementById('canvas-container');
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // Mobil performans optimizasyonu: Piksel oranını max 2 ile sınırla
+        // Bu, yüksek çözünürlüklü telefonlarda ısınmayı ve kasmayı engeller
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        container.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 3.0, 18.0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enablePan = false; // Kaydırmayı kapattık, sadece döndürme ve zoom
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 2.0;
+        controls.maxDistance = 100.0;
+        controls.rotateSpeed = 0.6; // Mobilde biraz daha hızlı tepki versin
+        controls.zoomSpeed = 0.8;
+
+        // ----------------------------------------------------------------------
+        // SHADER TANIMLARI (v8'deki "Yumuşak/Akışkan" versiyon)
+        // ----------------------------------------------------------------------
+
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            precision highp float;
+
+            uniform vec2 uResolution;
+            uniform float uTime;
+            uniform vec3 uCamPos;
+            uniform vec3 uCamTarget;
+            uniform float uFov;
+
+            #define MAX_STEPS 100 
+            #define BH_RADIUS 1.5 
+            #define DISK_INNER 2.0 
+            #define DISK_OUTER 9.5
+            #define GRAVITY_STRENGTH 1.2 
+
+            float hash(float n) { return fract(sin(n) * 43758.5453123); }
+            
+            float noise(vec3 x) {
+                vec3 p = floor(x);
+                vec3 f = fract(x);
+                f = f * f * (3.0 - 2.0 * f); 
+                float n = p.x + p.y * 57.0 + 113.0 * p.z;
+                return mix(mix(mix(hash(n + 0.0), hash(n + 1.0), f.x),
+                            mix(hash(n + 57.0), hash(n + 58.0), f.x), f.y),
+                        mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
+                            mix(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z);
+            }
+            
+            float fbm(vec3 p) {
+                float f = 0.0;
+                float amp = 0.5;
+                for(int i=0; i<3; i++){ 
+                    f += amp * noise(p);
+                    p *= 2.0;
+                    amp *= 0.5;
+                }
+                return f;
+            }
+
+            vec4 getDiskColor(vec3 p, float dist) {
+                float diskY = abs(p.y);
+                if (dist < DISK_INNER || dist > DISK_OUTER || diskY > 0.2) return vec4(0.0);
+
+                float angle = atan(p.z, p.x);
+                float speedBase = 4.0 / sqrt(dist); 
+                
+                float rot = angle + uTime * speedBase * 0.3;
+                
+                vec3 coordCloud = vec3(dist * 1.5, rot * 2.0, uTime * 0.1);
+                float cloud = fbm(coordCloud);
+                
+                float striations = sin(dist * 20.0 + cloud * 5.0); 
+                striations = smoothstep(-0.5, 0.5, striations); 
+                
+                float density = cloud * 0.6 + striations * 0.4;
+                density = 0.2 + density * 0.8; 
+
+                density *= smoothstep(DISK_INNER, DISK_INNER + 0.8, dist);
+                density *= smoothstep(DISK_OUTER, DISK_OUTER - 2.0, dist);
+                density *= smoothstep(0.2, 0.0, diskY); 
+
+                vec3 coreColor = vec3(1.3, 1.1, 0.9); 
+                vec3 fluidColor = vec3(1.0, 0.5, 0.1); 
+                vec3 deepColor = vec3(0.4, 0.05, 0.01); 
+
+                vec3 col = mix(deepColor, fluidColor, density);
+                col = mix(col, coreColor, pow(density, 3.0));
+
+                vec3 diskVel = normalize(vec3(-p.z, 0.0, p.x)); 
+                vec3 viewDir = normalize(uCamPos - p);
+                float doppler = dot(diskVel, viewDir);
+                
+                float intensity = 1.0 + doppler * 0.65; 
+                intensity = pow(intensity, 1.8); 
+
+                col = mix(col, vec3(0.01, 0.0, 0.0), smoothstep(0.2, -1.0, doppler)); 
+                col = mix(col, vec3(0.9, 0.95, 1.0), smoothstep(0.4, 1.0, doppler) * 0.25); 
+
+                return vec4(col * intensity * 1.8, density * 2.0);
+            }
+
+            vec3 getSkybox(vec3 dir) {
+                vec3 finalColor = vec3(0.005, 0.005, 0.01); 
+                float blueNoise = fbm(dir * 1.5 + vec3(0.1, 0.5, 0.1));
+                vec3 blueTone = vec3(0.02, 0.05, 0.15); 
+                finalColor += blueTone * smoothstep(0.2, 0.8, blueNoise);
+                float purpleNoise = fbm(dir * 2.0 - vec3(0.5, 0.0, 0.5));
+                vec3 purpleTone = vec3(0.08, 0.02, 0.1);
+                finalColor += purpleTone * smoothstep(0.4, 0.9, purpleNoise) * 0.8;
+                float wisp = fbm(dir * 4.0);
+                finalColor += vec3(0.05, 0.06, 0.08) * wisp * 0.5;
+                vec3 starDir = dir * 800.0; 
+                float s = fract(sin(dot(starDir, vec3(12.9898, 78.233, 45.543))) * 43758.5453);
+                if(s > 0.998) {
+                    float brightness = (s - 0.998) * 800.0;
+                    finalColor += vec3(0.9, 0.95, 1.0) * brightness;
+                }
+                return finalColor;
+            }
+
+            void main() {
+                vec2 uv = (gl_FragCoord.xy - 0.5 * uResolution.xy) / uResolution.y;
+                vec3 ro = uCamPos;
+                vec3 fwd = normalize(uCamTarget - ro);
+                vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+                vec3 up = cross(fwd, right);
+                float fovFunc = tan(radians(uFov) * 0.5);
+                vec3 rd = normalize(fwd + uv.x * right * fovFunc + uv.y * up * fovFunc);
+
+                vec3 p = ro;      
+                vec3 dir = rd;    
+                vec3 col = vec3(0.0);
+                vec4 accumColor = vec4(0.0);
+                float stepSize = 0.1; 
+
+                for(int i = 0; i < MAX_STEPS; i++) {
+                    float r = length(p);
+                    if(r < BH_RADIUS) { col = vec3(0.0); break; }
+
+                    float distToPlane = abs(p.y);
+                    
+                    if(distToPlane < stepSize * 1.5) { 
+                         vec4 diskSample = getDiskColor(p, r);
+                         diskSample.rgb *= diskSample.a;
+                         accumColor += diskSample * (1.0 - accumColor.a);
+                         if(accumColor.a > 0.99) break;
+                    }
+
+                    vec3 gravityDir = normalize(-p);
+                    float bendForce = GRAVITY_STRENGTH / (r * r); 
+                    dir = normalize(dir + gravityDir * bendForce * stepSize);
+                    stepSize = max(0.05, r * 0.08);
+                    p += dir * stepSize;
+                    if(r > 80.0) break; 
+                }
+
+                if(accumColor.a < 0.99 && length(p) > BH_RADIUS) {
+                    vec3 bg = getSkybox(dir); 
+                    col = accumColor.rgb + bg * (1.0 - accumColor.a);
+                } else {
+                    col = accumColor.rgb;
+                }
+                
+                col = pow(col, vec3(0.55)); 
+                col += accumColor.rgb * 0.25; 
+
+                gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const material = new THREE.ShaderMaterial({
+            vertexShader: vertexShader,
+            fragmentShader: fragmentShader,
+            uniforms: {
+                uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                uTime: { value: 0 },
+                uCamPos: { value: camera.position },
+                uCamTarget: { value: new THREE.Vector3(0, 0, 0) },
+                uFov: { value: 45 }
+            },
+            depthWrite: false,
+            depthTest: false
+        });
+
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.frustumCulled = false;
+        scene.add(mesh);
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+            controls.update();
+
+            // Mobilde performans için resolution güncellemesini her karede yapmaya gerek olmayabilir,
+            // ama resize event'i zaten hallediyor. Burada sadece animasyon parametreleri kalsın.
+            material.uniforms.uResolution.value.set(
+                window.innerWidth * window.devicePixelRatio, // Bu değer resize'da güncellendiği için burada tekrar set etmek güvenlidir
+                window.innerHeight * window.devicePixelRatio
+            );
+            material.uniforms.uTime.value = time;
+            material.uniforms.uCamPos.value.copy(camera.position);
+            material.uniforms.uFov.value = camera.fov;
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            // Pixel ratio'yu resize'da da koru
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        });
+
+        animate();
+    </script>
+</body>
+
+</html>
